@@ -1,16 +1,3 @@
-# Podium — build APK di GitHub Actions (tanpa PC, tanpa Android Studio)
-#
-# Cara pakai:
-#   1. File ini ada di  .github/workflows/build-apk.yml  (di ROOT repo, bukan di dalam subfolder)
-#   2. Tab "Actions" -> pilih "Build APK" -> tombol "Run workflow" -> "Run workflow"
-#   3. Tunggu sampai tanda centang hijau, lalu buka run itu -> bagian "Artifacts" -> unduh
-#      "podium-apk"
-#
-# Struktur repo yang dipakai workflow ini (hasil pemeriksaan langsung):
-#   - gradlew ada di ROOT repo (mode 644, jadi di-chmod dulu)
-#   - Gradle 9.8.0 lewat wrapper, AGP 9.4.1, Kotlin 2.4.20 -> butuh JDK 21
-#   - compileSdk 37 -> butuh "platforms;android-37.0" (bukan "android-37")
-
 name: Build APK
 
 on:
@@ -67,17 +54,37 @@ jobs:
       - name: 3. Aktifkan cache Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: 4. Siapkan Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: 5. Pasang platform SDK 37 + build-tools
+      - name: 4. Pasang Android command-line tools sendiri (menggantikan setup-android)
+        # PERBAIKAN (build #2 gagal di sini): android-actions/setup-android@v3 memasang
+        # cmdline-tools 12.0 lalu menjalankan `sdkmanager --licenses` pada cmdline-tools 16.0.
+        # Akibatnya sdkmanager menanyakan lisensi (y/N) dan job berhenti. Versi di bawah resmi,
+        # dan lisensinya diterima lewat pipe `yes`, jadi tidak mungkin menggantung.
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install "platforms;android-${ANDROID_COMPILE_SDK}.0" \
-                              "build-tools;${ANDROID_BUILD_TOOLS}" \
-                              "platform-tools"
-          sdkmanager --list_installed | sed -n '1,40p'
+          mkdir -p "$HOME/android-sdk/cmdline-tools"
+          curl -fsSL -o "$RUNNER_TEMP/cmdline-tools.zip" \
+            "https://dl.google.com/android/repository/commandlinetools-linux-16111833_latest.zip"
+          unzip -q "$RUNNER_TEMP/cmdline-tools.zip" -d "$RUNNER_TEMP/cmdline-tools-unzipped"
+          mv "$RUNNER_TEMP/cmdline-tools-unzipped/cmdline-tools" "$HOME/android-sdk/cmdline-tools/latest"
+          echo "ANDROID_HOME=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$HOME/android-sdk" >> "$GITHUB_ENV"
+          echo "$HOME/android-sdk/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          "$HOME/android-sdk/cmdline-tools/latest/bin/sdkmanager" --version
+
+      - name: 5. Terima lisensi + pasang platform SDK 37 dan build-tools
+        run: |
+          set -euo pipefail
+          set +o pipefail
+          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses > /dev/null
+          set -o pipefail
+          sdkmanager --sdk_root="$ANDROID_HOME" --install \
+            "platform-tools" \
+            "platforms;android-37.0" \
+            "build-tools;37.0.0"
+          echo "=== Isi $ANDROID_HOME/platforms ==="
+          ls "$ANDROID_HOME/platforms"
+          echo "=== Isi $ANDROID_HOME/build-tools ==="
+          ls "$ANDROID_HOME/build-tools"
 
       - name: 6. Periksa Gradle Wrapper (gradlew di root repo)
         run: |
@@ -245,3 +252,4 @@ jobs:
             dist/README-BUILD.txt
           if-no-files-found: error
           retention-days: 30
+          

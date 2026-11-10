@@ -1,0 +1,247 @@
+# Podium — build APK di GitHub Actions (tanpa PC, tanpa Android Studio)
+#
+# Cara pakai:
+#   1. File ini ada di  .github/workflows/build-apk.yml  (di ROOT repo, bukan di dalam subfolder)
+#   2. Tab "Actions" -> pilih "Build APK" -> tombol "Run workflow" -> "Run workflow"
+#   3. Tunggu sampai tanda centang hijau, lalu buka run itu -> bagian "Artifacts" -> unduh
+#      "podium-apk"
+#
+# Struktur repo yang dipakai workflow ini (hasil pemeriksaan langsung):
+#   - gradlew ada di ROOT repo (mode 644, jadi di-chmod dulu)
+#   - Gradle 9.8.0 lewat wrapper, AGP 9.4.1, Kotlin 2.4.20 -> butuh JDK 21
+#   - compileSdk 37 -> butuh "platforms;android-37.0" (bukan "android-37")
+
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      versionCode:
+        description: "versionCode (kosongkan untuk 8)"
+        required: false
+        default: "8"
+      versionName:
+        description: "versionName (kosongkan untuk 0.1.5.1-mod)"
+        required: false
+        default: "0.1.5.1-mod"
+  push:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/build-apk.yml"
+      - "app/**"
+      - "player/**"
+      - "sources/**"
+      - "feature/**"
+      - "core/**"
+      - "gradle/**"
+      - "build-logic/**"
+      - "*.gradle.kts"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      ANDROID_COMPILE_SDK: "37"
+      ANDROID_BUILD_TOOLS: "37.0.0"
+
+    steps:
+      - name: 1. Ambil isi repository
+        uses: actions/checkout@v4
+
+      - name: 2. Pasang JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: 3. Aktifkan cache Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: 4. Siapkan Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 5. Pasang platform SDK 37 + build-tools
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-${ANDROID_COMPILE_SDK}.0" \
+                              "build-tools;${ANDROID_BUILD_TOOLS}" \
+                              "platform-tools"
+          sdkmanager --list_installed | sed -n '1,40p'
+
+      - name: 6. Periksa Gradle Wrapper (gradlew di root repo)
+        run: |
+          set -euo pipefail
+          ls -la gradlew gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew
+          ./gradlew --version
+          echo "java: $(java -version 2>&1 | head -1)"
+
+      - name: 7. Siapkan keystore untuk menandatangani APK
+        id: keystore
+        env:
+          KS_B64: ${{ secrets.PODIUM_KEYSTORE_BASE64 }}
+          KS_STORE_PASS: ${{ secrets.PODIUM_KEYSTORE_PASSWORD }}
+          KS_KEY_PASS: ${{ secrets.PODIUM_KEY_PASSWORD }}
+          KS_ALIAS: ${{ secrets.PODIUM_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -n "${KS_B64:-}" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/podium-release.jks"
+            echo "storeFile=$RUNNER_TEMP/podium-release.jks" >> "$GITHUB_OUTPUT"
+            echo "storePassword=$KS_STORE_PASS"             >> "$GITHUB_OUTPUT"
+            echo "keyAlias=${KS_ALIAS:-podium}"             >> "$GITHUB_OUTPUT"
+            echo "keyPassword=${KS_KEY_PASS:-$KS_STORE_PASS}" >> "$GITHUB_OUTPUT"
+            echo "signed=stable" >> "$GITHUB_OUTPUT"
+            echo "Keystore dari Secrets dipakai (kunci tetap: update bisa dipasang di atas versi lama)."
+          else
+            # Tanpa Secrets: kunci sementara, hanya supaya APK bisa dipasang. APK dari run lain
+            # TIDAK bisa dipasang menimpa APK ini (beda kunci) -> harus uninstall dulu.
+            keytool -genkeypair -v \
+              -keystore "$RUNNER_TEMP/podium-release.jks" \
+              -storetype PKCS12 -storepass podiumtemporary \
+              -alias podium -keyalg RSA -keysize 4096 -validity 10000 \
+              -dname "CN=Podium Temporary" > /dev/null 2>&1
+            echo "storeFile=$RUNNER_TEMP/podium-release.jks" >> "$GITHUB_OUTPUT"
+            echo "storePassword=podiumtemporary"            >> "$GITHUB_OUTPUT"
+            echo "keyAlias=podium"                          >> "$GITHUB_OUTPUT"
+            echo "keyPassword=podiumtemporary"              >> "$GITHUB_OUTPUT"
+            echo "signed=temporary" >> "$GITHUB_OUTPUT"
+            echo "::warning::Secrets keystore belum diisi. APK ditandatangani kunci SEMENTARA."
+          fi
+
+      - name: 8. Build APK release
+        env:
+          PODIUM_KEYSTORE_FILE: ${{ steps.keystore.outputs.storeFile }}
+          PODIUM_KEYSTORE_PASSWORD: ${{ steps.keystore.outputs.storePassword }}
+          PODIUM_KEY_ALIAS: ${{ steps.keystore.outputs.keyAlias }}
+          PODIUM_KEY_PASSWORD: ${{ steps.keystore.outputs.keyPassword }}
+        run: |
+          set -euo pipefail
+          # -Dorg.gradle.jvmargs menimpa batas memori 2 GB di gradle.properties (runner punya ~7 GB).
+          # Lint dan unit test sengaja dilewati: yang kita butuhkan hanya APK-nya.
+          ./gradlew :app:assembleRelease \
+            -Ppodium.versionCode="${{ inputs.versionCode || '8' }}" \
+            -Ppodium.versionName="${{ inputs.versionName || '0.1.5.1-mod' }}" \
+            "-Dorg.gradle.jvmargs=-Xmx4g -XX:+UseParallelGC -Dfile.encoding=UTF-8" \
+            "-Dkotlin.daemon.jvmargs=-Xmx2g" \
+            -x lint -x lintVitalRelease -x test \
+            --no-daemon --stacktrace
+          find app/build/outputs -name "*.apk" -o -name "*.json" | sort
+
+      - name: 9. Rapikan nama file APK
+        id: apk
+        run: |
+          set -euo pipefail
+          SRC=$(find app/build/outputs/apk/release -maxdepth 1 -name "*.apk" | head -1)
+          echo "APK hasil build: $SRC"
+          cp "$SRC" "$RUNNER_TEMP/podium-unsigned.apk"
+          echo "path=$RUNNER_TEMP/podium-unsigned.apk" >> "$GITHUB_OUTPUT"
+
+      - name: 10. Sejajarkan (zipalign) dan tanda tangani APK
+        id: sign
+        env:
+          KS_FILE: ${{ steps.keystore.outputs.storeFile }}
+          KS_ALIAS: ${{ steps.keystore.outputs.keyAlias }}
+          KS_STORE_PASS: ${{ steps.keystore.outputs.storePassword }}
+          KS_KEY_PASS: ${{ steps.keystore.outputs.keyPassword }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}"
+          mkdir -p dist
+          "$BT/zipalign" -p -f 4 "$RUNNER_TEMP/podium-unsigned.apk" "$RUNNER_TEMP/podium-aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$KS_FILE" --ks-key-alias "$KS_ALIAS" \
+            --ks-pass "env:KS_STORE_PASS" --key-pass "env:KS_KEY_PASS" \
+            --min-sdk-version 29 \
+            --out "dist/podium.apk" "$RUNNER_TEMP/podium-aligned.apk"
+          "$BT/apksigner" verify --print-certs "dist/podium.apk"
+          echo "path=dist/podium.apk" >> "$GITHUB_OUTPUT"
+
+      - name: 11. VERIFIKASI izin yang ada di APK final
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}"
+          APK="dist/podium.apk"
+          echo "=== Seluruh izin di APK hasil build ==="
+          "$BT/aapt2" dump permissions "$APK" | tee permissions.txt
+          echo
+          echo "=== Pemeriksaan izin berisiko ==="
+          FAIL=0
+          for P in \
+            "android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" \
+            "android.permission.REQUEST_INSTALL_PACKAGES" \
+            "android.permission.RECEIVE_BOOT_COMPLETED" \
+            "android.permission.FOREGROUND_SERVICE_DATA_SYNC" \
+            "android.permission.READ_SMS" \
+            "android.permission.RECEIVE_SMS" \
+            "android.permission.BIND_ACCESSIBILITY_SERVICE" \
+            "android.permission.SYSTEM_ALERT_WINDOW" \
+            "android.permission.QUERY_ALL_PACKAGES" ; do
+            if grep -q "$P" permissions.txt; then echo "MASIH ADA  : $P"; FAIL=1; else echo "sudah hilang: $P"; fi
+          done
+          echo
+          echo "=== Izin inti musik yang WAJIB tetap ada ==="
+          for P in \
+            "android.permission.INTERNET" \
+            "android.permission.ACCESS_NETWORK_STATE" \
+            "android.permission.FOREGROUND_SERVICE" \
+            "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" \
+            "android.permission.WAKE_LOCK" \
+            "android.permission.READ_MEDIA_AUDIO" ; do
+            if grep -q "$P" permissions.txt; then echo "ADA        : $P"; else echo "HILANG!    : $P"; FAIL=1; fi
+          done
+          if [ "$FAIL" -ne 0 ]; then echo "::error::Verifikasi izin gagal, APK tidak diunggah."; exit 1; fi
+          echo "Verifikasi izin lulus."
+
+      - name: 12. Buat keterangan build
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/${ANDROID_BUILD_TOOLS}"
+          APK="dist/podium.apk"
+          SHA=$(sha256sum "$APK" | awk '{print $1}')
+          SIZE=$(du -h "$APK" | awk '{print $1}')
+          {
+            echo "Podium — APK hasil build GitHub Actions"
+            echo "Commit      : ${{ github.sha }}"
+            echo "versionName : ${{ inputs.versionName || '0.1.5.1-mod' }}"
+            echo "versionCode : ${{ inputs.versionCode || '8' }}"
+            echo "Ukuran      : $SIZE"
+            echo "SHA-256     : $SHA"
+            echo "Tanda tangan: ${{ steps.keystore.outputs.signed }}"
+            echo
+            echo "Izin di APK ini:"
+            cat permissions.txt
+            echo
+            if [ "${{ steps.keystore.outputs.signed }}" = "temporary" ]; then
+              echo "PERHATIAN: APK ini ditandatangani kunci SEMENTARA dari run ini."
+              echo "Memasang APK dari run lain di atasnya akan gagal ('App not installed')."
+              echo "Uninstall dulu kalau perlu."
+            else
+              echo "APK ini ditandatangani kunci tetap dari Secrets, jadi update bisa dipasang"
+              echo "langsung di atas versi sebelumnya (tanpa uninstall)."
+            fi
+            echo
+            echo "Cara memasang: unduh artifact, buka dengan file manager, izinkan 'Install unknown apps'."
+          } > "dist/README-BUILD.txt"
+          cat "dist/README-BUILD.txt"
+
+      - name: 13. Unggah APK sebagai Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: podium-apk
+          path: |
+            dist/podium.apk
+            dist/README-BUILD.txt
+          if-no-files-found: error
+          retention-days: 30

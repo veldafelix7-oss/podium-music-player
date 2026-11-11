@@ -303,7 +303,11 @@ internal class UpdateCenter(
     }
 
     companion object {
-        const val REPOSITORY = "GHOSTxASR/podium-music-player"
+        // MODIFIED BUILD (11 Nov 2026): diarahkan ke fork, yang tidak menerbitkan Release GitHub.
+        // `releases/latest` menjawab 404: pemeriksaan otomatis diam (tidak ada notis, tidak ada unduhan);
+        // pemeriksaan manual (Settings ▸ Software update ▸ Check now) menampilkan "Couldn't check for updates".
+        // Jangan terbitkan Release di fork selama REQUEST_INSTALL_PACKAGES dihapus (lihat UpdateInstaller.allowed()).
+        const val REPOSITORY = "veldafelix7-oss/podium-music-player"
         const val LATEST_URL = "https://api.github.com/repos/$REPOSITORY/releases/latest"
         const val RELEASES_PAGE = "https://github.com/$REPOSITORY/releases/latest"
 
